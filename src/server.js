@@ -4,6 +4,38 @@ import OpenAI from 'openai';
 import { createClient } from '@supabase/supabase-js';
 
 const fastify = Fastify({ logger: true });
+async function responsesCreate(payload) {
+  const res = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+    },
+    body: JSON.stringify(payload)
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`${res.status} ${text}`);
+  try { return JSON.parse(text); } catch { return { raw: text }; }
+}
+
+// Health-check LLM endpoint: sends a tiny prompt and returns raw result
+fastify.get('/api/brain/llm-ping', async (request, reply) => {
+  try {
+    const resp = await responsesCreate({
+      model: MODEL,
+      input: [
+        { role: 'system', content: [ { type: 'text', text: 'Ты ассистент. Ответь одним словом: ok' } ] },
+        { role: 'user', content: [ { type: 'text', text: 'ping' } ] }
+      ],
+      max_output_tokens: 16
+    });
+    const txt = resp.output_text || '';
+    return reply.send({ ok: true, model: MODEL, raw: txt });
+  } catch (e) {
+    return reply.code(500).send({ ok: false, error: String(e) });
+  }
+});
+
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
   ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
@@ -12,9 +44,23 @@ const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_
 const FB_API_VERSION = 'v20.0';
 const MODEL = process.env.BRAIN_MODEL || 'gpt-4.1';
 const USE_LLM = String(process.env.BRAIN_USE_LLM || 'true').toLowerCase() === 'true';
+const CAN_USE_LLM = USE_LLM && Boolean(process.env.OPENAI_API_KEY);
 const AGENT_URL = (process.env.AGENT_SERVICE_URL || '').replace(/\/+$/,'') + '/api/agent/actions';
+const BRAIN_DRY_RUN = String(process.env.BRAIN_DRY_RUN || 'false').toLowerCase() === 'true';
+const BRAIN_MAX_ACTIONS_PER_RUN = Number(process.env.BRAIN_MAX_ACTIONS_PER_RUN || '5');
+const BRAIN_DEBUG_LLM = String(process.env.BRAIN_DEBUG_LLM || 'false').toLowerCase() === 'true';
 
-const ALLOWED_TYPES = new Set(['GetCampaignStatus','PauseCampaign','UpdateAdSetDailyBudget']);
+const ALLOWED_TYPES = new Set([
+  'GetCampaignStatus',
+  'PauseCampaign',
+  'UpdateAdSetDailyBudget',
+  'PauseAd',
+  // Workflows (executor manual handlers)
+  'Workflow.DuplicateAndPauseOriginal',
+  'Workflow.DuplicateKeepOriginalActive',
+  // Audience tools
+  'Audience.DuplicateAdSetWithAudience'
+]);
 
 function genIdem() {
   const d = new Date();
@@ -64,7 +110,7 @@ async function fetchAccountStatus(adAccountId, accessToken) {
 }
 async function fetchAdsets(adAccountId, accessToken) {
   const url = new URL(`https://graph.facebook.com/${FB_API_VERSION}/${adAccountId}/adsets`);
-  url.searchParams.set('fields','id,name,daily_budget');
+  url.searchParams.set('fields','id,name,campaign_id,daily_budget,lifetime_budget,status');
   url.searchParams.set('access_token', accessToken);
   return fbGet(url.toString());
 }
@@ -72,34 +118,440 @@ async function fetchYesterdayInsights(adAccountId, accessToken) {
   const url = new URL(`https://graph.facebook.com/${FB_API_VERSION}/${adAccountId}/insights`);
   url.searchParams.set('fields','campaign_name,campaign_id,adset_name,adset_id,ad_name,ad_id,spend,actions,cpm,ctr,video_thruplay_watched_actions');
   url.searchParams.set('date_preset','yesterday');
-  url.searchParams.set('level','ad');
+  url.searchParams.set('level','adset');
+  url.searchParams.set('action_breakdowns','action_type');
   url.searchParams.set('access_token', accessToken);
   return fbGet(url.toString());
+}
+
+async function fetchInsightsPreset(adAccountId, accessToken, datePreset) {
+  const url = new URL(`https://graph.facebook.com/${FB_API_VERSION}/${adAccountId}/insights`);
+  url.searchParams.set('fields','campaign_name,campaign_id,adset_name,adset_id,spend,actions,cpm,ctr,impressions,frequency');
+  url.searchParams.set('date_preset', datePreset);
+  url.searchParams.set('level','adset');
+  url.searchParams.set('action_breakdowns','action_type');
+  url.searchParams.set('access_token', accessToken);
+  return fbGet(url.toString());
+}
+
+async function fetchAdLevelInsightsPreset(adAccountId, accessToken, datePreset) {
+  const url = new URL(`https://graph.facebook.com/${FB_API_VERSION}/${adAccountId}/insights`);
+  url.searchParams.set('fields','ad_name,ad_id,adset_id,spend,actions,impressions');
+  url.searchParams.set('date_preset', datePreset);
+  url.searchParams.set('level','ad');
+  url.searchParams.set('action_breakdowns','action_type');
+  url.searchParams.set('access_token', accessToken);
+  return fbGet(url.toString());
+}
+
+async function fetchCampaignInsightsPreset(adAccountId, accessToken, datePreset) {
+  const url = new URL(`https://graph.facebook.com/${FB_API_VERSION}/${adAccountId}/insights`);
+  url.searchParams.set('fields','campaign_name,campaign_id,spend,actions,cpm,ctr,impressions,frequency');
+  url.searchParams.set('date_preset', datePreset);
+  url.searchParams.set('level','campaign');
+  url.searchParams.set('action_breakdowns','action_type');
+  url.searchParams.set('access_token', accessToken);
+  return fbGet(url.toString());
+}
+
+async function fetchCampaigns(adAccountId, accessToken) {
+  const url = new URL(`https://graph.facebook.com/${FB_API_VERSION}/${adAccountId}/campaigns`);
+  url.searchParams.set('fields','id,name,status,effective_status,daily_budget,lifetime_budget');
+  url.searchParams.set('access_token', accessToken);
+  return fbGet(url.toString());
+}
+
+function sumInt(a, b) { return (Number.isFinite(a)?a:0) + (Number.isFinite(b)?b:0); }
+
+function computeLeadsFromActions(stat) {
+  let messagingLeads = 0;
+  let qualityLeads = 0;
+  let siteLeads = 0;
+  let formLeads = 0;
+  const actions = Array.isArray(stat?.actions) ? stat.actions : [];
+  for (const action of actions) {
+    const t = action?.action_type;
+    const v = parseInt(action?.value || '0', 10) || 0;
+    if (t === 'onsite_conversion.total_messaging_connection') {
+      messagingLeads = v;
+    } else if (t === 'onsite_conversion.messaging_user_depth_2_message_send') {
+      qualityLeads = v;
+    } else if (t === 'lead' || t === 'fb_form_lead' || (typeof t === 'string' && (t.includes('fb_form_lead') || t.includes('leadgen')))) {
+      formLeads = sumInt(formLeads, v);
+    } else if (t === 'onsite_web_lead') {
+      siteLeads = sumInt(siteLeads, v);
+    } else if (t === 'offsite_conversion.fb_pixel_lead') {
+      siteLeads = sumInt(siteLeads, v);
+    } else if (t === 'offsite_conversion.lead') {
+      siteLeads = sumInt(siteLeads, v);
+    } else if (typeof t === 'string' && t.startsWith('offsite_conversion.custom')) {
+      siteLeads = sumInt(siteLeads, v);
+    } else if (typeof t === 'string' && t.startsWith('offsite_conversion.') && !String(t).includes('fb_form_lead') && (String(t).includes('lead') || String(t).includes('custom'))) {
+      siteLeads = sumInt(siteLeads, v);
+    }
+  }
+  const leads = messagingLeads + siteLeads + formLeads;
+  return { messagingLeads, qualityLeads, siteLeads, formLeads, leads };
+}
+
+function indexByAdset(rows) {
+  const map = new Map();
+  for (const r of rows || []) {
+    const id = r.adset_id;
+    if (!id) continue;
+    const prev = map.get(id) || { spend:0, impressions:0, ctr:0, cpm:0, frequency:0, samples:0, actions:[], campaign_id: r.campaign_id };
+    prev.spend = sumInt(prev.spend, Number(r.spend)||0);
+    prev.impressions = sumInt(prev.impressions, Number(r.impressions)||0);
+    // keep latest ratios if present
+    prev.ctr = r.ctr !== undefined ? Number(r.ctr)||0 : prev.ctr;
+    prev.cpm = r.cpm !== undefined ? Number(r.cpm)||0 : prev.cpm;
+    prev.frequency = r.frequency !== undefined ? Number(r.frequency)||0 : prev.frequency;
+    if (Array.isArray(r.actions)) prev.actions = r.actions;
+    if (!prev.campaign_id && r.campaign_id) prev.campaign_id = r.campaign_id;
+    map.set(id, prev);
+  }
+  return map;
+}
+
+function indexAdsByAdset(rows) {
+  const map = new Map();
+  for (const r of rows || []) {
+    const adsetId = r.adset_id;
+    if (!adsetId || !r.ad_id) continue;
+    const list = map.get(adsetId) || [];
+    list.push({ ad_id: r.ad_id, ad_name: r.ad_name, spend: Number(r.spend)||0, actions: r.actions || [], impressions: Number(r.impressions)||0 });
+    map.set(adsetId, list);
+  }
+  return map;
+}
+
+function median(values) {
+  const arr = (values || []).filter(v=>Number.isFinite(v)).slice().sort((a,b)=>a-b);
+  if (!arr.length) return 0;
+  const mid = Math.floor(arr.length/2);
+  return arr.length % 2 ? arr[mid] : (arr[mid-1]+arr[mid])/2;
+}
+
+function indexByCampaign(rows) {
+  const map = new Map();
+  for (const r of rows || []) {
+    const id = r.campaign_id;
+    if (!id) continue;
+    const prev = map.get(id) || { spend:0, impressions:0, ctr:0, cpm:0, frequency:0, actions:[] };
+    prev.spend = sumInt(prev.spend, Number(r.spend)||0);
+    prev.impressions = sumInt(prev.impressions, Number(r.impressions)||0);
+    prev.ctr = r.ctr !== undefined ? Number(r.ctr)||0 : prev.ctr;
+    prev.cpm = r.cpm !== undefined ? Number(r.cpm)||0 : prev.cpm;
+    prev.frequency = r.frequency !== undefined ? Number(r.frequency)||0 : prev.frequency;
+    if (Array.isArray(r.actions)) prev.actions = r.actions;
+    map.set(id, prev);
+  }
+  return map;
+}
+
+function computeHealthScoreForAdset(opts) {
+  const { weights, classes, targets, windows, peers } = opts;
+  const { y, d3, d7, d30, today } = windows;
+  const impressions = y.impressions || 0;
+  const volumeFactor = impressions >= 1000 ? 1.0 : (impressions <= 100 ? 0.6 : 0.6 + 0.4*Math.min(1,(impressions-100)/900));
+  const spendY = y.spend || 0;
+  const leadsY = computeLeadsFromActions(y).leads || 0;
+  const qLeadsY = computeLeadsFromActions(y).qualityLeads || 0;
+  const targetCpl = targets.cpl_cents || 200;
+  const isWA = true; // эвристика: позже заменим на определение из цели кампании
+  const denom = isWA && qLeadsY >= 3 ? qLeadsY : leadsY;
+  const eCplY = denom > 0 ? (spendY*100)/denom : Infinity; // в центах
+
+  // тренды: сравним eCPL d3 vs d7, d7 vs d30 (грубая оценка)
+  function eCPLFromBucket(b) {
+    const L = computeLeadsFromActions(b);
+    const d = (isWA && L.qualityLeads >= 3) ? L.qualityLeads : L.leads;
+    return d > 0 ? (b.spend*100)/d : Infinity;
+  }
+  const e3 = eCPLFromBucket(d3);
+  const e7 = eCPLFromBucket(d7);
+  const e30 = eCPLFromBucket(d30);
+  let trendScore = 0;
+  if (Number.isFinite(e3) && Number.isFinite(e7)) trendScore += (e3 < e7 ? weights.trend : -weights.trend/2);
+  if (Number.isFinite(e7) && Number.isFinite(e30)) trendScore += (e7 < e30 ? weights.trend : -weights.trend/2);
+
+  // CPL gap
+  let cplScore = 0;
+  if (Number.isFinite(eCplY)) {
+    const ratio = eCplY / targetCpl;
+    if (ratio <= 0.7) cplScore = weights.cpl_gap;
+    else if (ratio <= 0.9) cplScore = Math.round(weights.cpl_gap*2/3);
+    else if (ratio <= 1.1) cplScore = 10;
+    else if (ratio <= 1.3) cplScore = -Math.round(weights.cpl_gap*2/3);
+    else cplScore = -weights.cpl_gap;
+  }
+
+  // Диагностика: CTR, CPM vs медианы, Frequency
+  let diag = 0;
+  const ctr = y.ctr || 0;
+  if (ctr < 1) diag -= weights.ctr_penalty;
+  const medianCpm = median(peers.cpm || []);
+  const cpm = y.cpm || 0;
+  if (medianCpm && cpm > medianCpm*1.3) diag -= weights.cpm_penalty;
+  const freq = y.frequency || 0;
+  if (freq > 2) diag -= weights.freq_penalty;
+
+  // Сегодняшняя компенсация
+  let todayAdj = 0;
+  if ((today.impressions||0) >= 300) {
+    const Ld = computeLeadsFromActions(today);
+    const dd = (isWA && Ld.qualityLeads >= 3) ? Ld.qualityLeads : Ld.leads;
+    const eToday = dd>0 ? (today.spend*100)/dd : Infinity;
+    if (Number.isFinite(eCplY) && Number.isFinite(eToday) && eToday <= 0.7*eCplY) {
+      todayAdj = Math.min(10, weights.cpl_gap/3);
+    }
+  }
+
+  let score = cplScore + trendScore + diag + todayAdj;
+  if (impressions < 1000) score = Math.round(score * volumeFactor);
+  // обучение смягчаем отдельным уровнем выше
+
+  // Класс HS
+  let cls = 'neutral';
+  if (score >= classes.very_good) cls = 'very_good';
+  else if (score >= classes.good) cls = 'good';
+  else if (score <= classes.bad) cls = 'bad';
+  else if (score <= classes.neutral_low) cls = 'neutral_low';
+
+  return { score, cls, eCplY, ctr, cpm, freq };
+}
+
+function decideBudgetChange(currentCents, hsCls, bounds) {
+  const { minCents, maxCents } = bounds;
+  let target = currentCents;
+  if (hsCls === 'very_good') target = Math.min(maxCents, Math.round(currentCents * 1.3));
+  else if (hsCls === 'good') target = currentCents; // либо лёгкий ап по недобору — в ребалансе
+  else if (hsCls === 'neutral_low' || hsCls === 'neutral') target = currentCents;
+  else if (hsCls === 'bad') target = Math.max(minCents, Math.round(currentCents * 0.5));
+  return target;
 }
 
 const SYSTEM_PROMPT = (clientPrompt) => [
   (clientPrompt || '').trim(),
   '',
-  'Роль: Проанализируй входные данные (Think), сформируй список действий и одним вызовом отправь их исполнителю; если целевые не заданы, считай CPL=2$ (200 центов), daily budget=20$ (2000 центов); работай только с активными кампаниями; Increase/Decrease всегда ±20% от установленного дневного бюджета ad set (в центах), не превышай общий дневной лимит; Stop Campaign, если 3 дня подряд CPL > 5$.',
+  'ОБЩИЙ КОНТЕКСТ (ЗАЧЕМ И КАК РАБОТАЕМ)',
+  '- Ты — таргетолог-агент, управляющий рекламой в Facebook Ads Manager через Aggregated Insights и Graph API.',
+  '- Бизнес-цель: (1) строго выдерживать общий суточный бюджет аккаунта и бюджеты по направлениям; (2) достигать планового CPL, а для WhatsApp — планового QCPL (стоимость качественного лида ≥2 сообщений).',
+  '- Почему такие решения: Facebook допускает колебания фактических трат и задержки атрибуции (особенно в переписках WA). Поэтому мы опираемся на «плановые» дневные бюджеты и анализируем несколько таймфреймов (yesterday/today/3d/7d/30d), где today смягчает «ложно-плохое» вчера.',
+  '- Почему нельзя резко поднимать бюджет: резкие апы ломают стадию обучения, расширяют аудиторию слишком быстро и повышают риск роста CPL. Поэтому ап ≤ +30%/шаг; даун до −50% допустим – это безопаснее для стоимости заявки.',
+  '- Почему учитываем CTR/CPM/Frequency: CTR<1% указывает на слабую связку оффер/креатив; CPM выше медианы пиров на ≥30% — сигнал дорогого аукциона/креатива; Frequency>2 (30д) — выгорание. Эти диагностики включаются, если по CPL/QCPL нет однозначности.',
+  '- Почему «лучший из плохого»: если нет явных победителей, полностью «гасить» всё нельзя — надо выполнять план расхода и искать положительную динамику. Тогда временно используем ad set с максимальным HS как опорный для добора бюджета малыми шагами, сохраняя тестовые минимумы на 1–2 альтернативы.',
+  '- Сферика: управляем только активными кампаниями/ad set. Агент сам кампании НЕ включает (запуск — решение пользователя). Дублирование ad set допускается только внутри активной кампании (как рекомендация — описывается в planNote/reportText, т.к. в списке допустимых действий нет явного «DuplicateAdSet»).',
+  '- Расписание: один раз в сутки, утренний чек 08:00 в таймзоне аккаунта. Порядок: гейты → сбор метрик → HS → матрица действий → ребаланс бюджета → отчёт.',
   '',
-  'Тул: SendActions',
-  '- POST https://agent2.performanteaiagency.com/api/agent/actions',
-  '- Headers: Content-Type: application/json',
-  '- BODY: { "idempotencyKey":"<uniq>", "source":"n8n", "account":{"userAccountId":"<UUID>"}, "actions":[{ "type":"<ActionName>", "params":{ } }]}',
+  'Ты — таргетолог-агент. На вход подаётся агрегированный анализ (Health Score, метрики по окнам yesterday/today/3d/7d/30d, списки ad set и кампаний, статусы аккаунта/кампаний, планы бюджетов по аккаунту и направлениям). Твоя задача — выдать строго валидный JSON-план действий, соблюдая правила и ограничения ниже.',
   '',
-  'Правила:',
-  '- Бюджеты в центах; 1$=100; 20$→2000; +20% → 2400; −20% → 1600.',
-  '- Увеличение/уменьшение только от установленного дневного бюджета ad set.',
-  '- Если new > 5000 — перепроверь; > 10000 — не отправляй.',
-  '- Работай только с ACTIVE (status=1).',
-  '- CPL считай по onsite_conversion.total_messaging_connection.',
+  'КОНТЕКСТ УПРАВЛЕНИЯ (НЕИЗМЕННО)',
+  '- Работай ТОЛЬКО с активными кампаниями/ad set (или явно помеченными к активации пользователем). Включать кампании НЕЛЬЗЯ.',
+  '- Кампании с CBO и ad set с lifetime_budget НЕ трогаем.',
+  '- Управление бюджетами ТОЛЬКО на уровне ad set (daily_budget).',
+  '- Разрешено ПАУЗИТЬ кампанию (PauseCampaign), ad set (через бюджет до минимума/отключение в бизнес-логике) и отдельные объявления (PauseAd).',
+  '- Все действия выполняются 1 раз в сутки, ориентир — утренний чек 08:00 в таймзоне АККАУНТА (если таймзона не передана, считать Asia/Almaty, +05:00).',
   '',
-  'Доступные действия (ровно эти):',
+  'ОСНОВНЫЕ ПРИНЦИПЫ И ПРИОРИТЕТЫ',
+  '- 1) Строго соблюдать плановый СУТОЧНЫЙ БЮДЖЕТ аккаунта и, если заданы, квоты БЮДЖЕТОВ по НАПРАВЛЕНИЯМ. Бюджеты в факте могут гулять у Facebook — мы держим целевые daily_budget, не «подкручивая» реактивно по факту.',
+  '- 2) Главный KPI — CPL (стоимость заявки). Для WhatsApp приоритет — QCPL (стоимость КАЧЕСТВЕННОГО лида ≥2 сообщений).',
+  '- 3) Решения принимаем по поэтапной логике: (A) таймфреймы → (B) класс HS → (C) матрица действий → (D) ребаланс до планов → (E) отчёт с причинами.',
+  '- 4) Если НЕТ «хороших» ad set (HS≥+25), применяем принцип «best of bad»: выбираем лучший по HS и используем его как временный опорный для добора плана с малыми шагами/рекомендацией дубля.',
+  '- 5) Новые связки (<48 ч с запуска) не дёргаем агрессивно: штрафы мягче, допускаются только мягкие корректировки и явные остановки при критике.',
+  '',
+  'KPI И ЛИДЫ (action_breakdowns=action_type)',
+  '- Пороговые/дефолтные цели при отсутствии входных: CPL_target=200 центов ($2), daily_default=2000 центов ($20).',
+  '- Лиды считаются суммой релевантных action_type:',
+  '  • Мессенджеры (старт диалога): onsite_conversion.total_messaging_connection',
+  '  • Качественные WA-лиды (≥2 сообщений): onsite_conversion.messaging_user_depth_2_message_send',
+  '  • Лид-формы: lead, fb_form_lead, leadgen',
+  '  • Сайт/пиксель: onsite_web_lead, offsite_conversion.lead, offsite_conversion.fb_pixel_lead, offsite_conversion.custom*',
+  '- Формулы: CPL = spend / max(total_leads,1); QCPL = spend / max(quality_leads,1). Для WhatsApp сначала QCPL; если quality_leads<3 на окне — опираемся на CPL.',
+  '',
+  'ТАЙМФРЕЙМЫ И ВЕСА',
+  '- Окна анализа: yesterday (50%), last_3d (25%), last_7d (15%), last_30d (10%).',
+  '- Today-компенсация: если impr_today≥300 и eCPL_today ≤ 0.7×eCPL_yesterday — смягчи вчерашние штрафы.',
+  '- Минимальная база для надёжных выводов: ≥1000 показов на уровне ad set в референсном окне; при меньших объёмах понижай доверие и избегай резких шагов.',
+  '',
+  'HEALTH SCORE (HS) — КАК СОБИРАЕМ',
+  '- HS ∈ [-100; +100] — сумма «плюсов/минусов» по компонентам с учётом объёма и today-компенсации:',
+  '  1) CPL/QCPL GAP к таргету (вес 45):',
+  '     • дешевле плана ≥30% → +45; 10–30% → +30; в пределах ±10% → +10 / −10; дороже 10–30% → −30; дороже ≥30% → −45.',
+  '  2) Тренд (3d vs 7d и 7d vs 30d), суммарно вес 15: улучшение → + до 15; ухудшение → − до 15.',
+  '  3) Диагностика (до −30 суммарно): CTR_all<1% → −8; CPM выше медианы «пиров» кампании на ≥30% → −12; Frequency_30d>2 → −10.',
+  '  4) Новизна (<48ч) — мягчитель: максимум −10 и/или множитель 0.7.',
+  '  5) Объём — множитель доверия 0.6…1.0 (при impr<1000 ближе к 0.6).',
+  '  6) Today-компенсация — уменьшает вчерашние штрафы, если сегодня явное улучшение.',
+  '- Классы HS: ≥+25=very_good; +5..+24=good; −5..+4=neutral; −25..−6=slightly_bad; ≤−25=bad.',
+  '',
+  'МАТРИЦА ДЕЙСТВИЙ (НА УРОВНЕ AD SET)',
+  '- very_good: масштабируй — повышай daily_budget на +10..+30%.',
+  '- good: держи; при недоборе плана — лёгкий ап +0..+10%.',
+  '- neutral: держи; если есть «пожиратель» (одно объявление тратит ≥50% spend и даёт плохой eCPL/QCPL) — PauseAd для него.',
+  '- slightly_bad: снижай daily_budget на −20..−50%; лечи креатив (PauseAd «пожирателя»); допустим дубль с новой аудиторией (отрази намерение в planNote).',
+  '- bad: допускается отключение ad set (через снижение до минимума/PAUSE в вашей бизнес-логике) или «реанимация»: дубль с отключением оригинала (отрази в planNote). ВКЛЮЧАТЬ кампанию НЕЛЬЗЯ.',
+  '',
+  'ДОПОЛНИТЕЛЬНЫЙ ИНСТРУМЕНТ: ДУБЛЬ НА ТЁПЛУЮ АУДИТОРИЮ (LAL 3% IG‑Engagers 365d)',
+  '- Назначение: смена аудитории на тёплую (LAL 3% от IG Engagers 365d) для связок с неудовлетворительным CPL. НЕ для масштабирования.',
+  '- Базовые гейты: аккаунт/кампания ACTIVE; не CBO; не lifetime; Advantage+ (плейсменты/настройки) сохраняются как в исходном ad set.',
+  '- Бюджет дубля: daily_budget = min(original_daily_budget, $10), но в пределах [300..10000] центов (т.е. максимум $10).',
+  '- Частота: не более 1 дубля на ad set в сутки (идемпотентность по ключу дня).',
+  '- Объём: impr_yesterday ≥ 1000 ИЛИ impr_last_3d ≥ 1500.',
+  '- Метрика «дороговизны»: CPL_ratio = фактический CPL (или QCPL для WA) / плановый_CPL ≥ 2.0 на окне yesterday ИЛИ last_3d.',
+  '- Решение по HS и бюджету (строго):',
+  '  • HS ≥ +25: дубль НЕ применять (приоритет — масштабирование победителя).',
+  '  • +5..+24 (good): дубль НЕ применять; сначала обычная оптимизация/ребаланс.',
+  '  • −5..+4 (neutral): если CPL_ratio ≥ 2.0 и объём достаточен — дубль (оригинал остаётся активен). Бюджет дубля ≤ $10.',
+  '  • −25..−6 (slightly_bad): если CPL_ratio ≥ 2.0 и объём достаточен — дубль. Пауза исходного допускается только при устойчиво плохих метриках (CPL_ratio ≥2.0 на last_3d И last_7d) или явном ухудшении (3d>7d) и если original_daily_budget > $10; иначе без паузы.',
+  '  • ≤ −25 (bad): если CPL_ratio ≥ 2.0 — «реанимация»: дубль и пауза исходного.',
+  '- Технически: создаём аудиторию LAL 3% IG Engagers 365d и дублируем ad set с include=[LAL]; креативы/оптимизация/плейсменты копируются без изменений (Advantage+ сохраняется).',
+  '- Экшен для дубля: Audience.DuplicateAdSetWithAudience {"source_adset_id","audience_id","daily_budget"<=1000,"name_suffix":"DUP LAL3 IG365"}.',
+  '',
+  'РЕБАЛАНС БЮДЖЕТА (АККАУНТ → НАПРАВЛЕНИЯ → AD SET)',
+  '- Цель: выйти ровно на плановые суммы (аккаунт и направления).',
+  '- При НЕДОБОРЕ расхода:',
+  '  • сначала добавляй тем, у кого HS≥+25 (в рамках лимитов);',
+  '  • если таких нет — применяй «best of bad»: выбери максимум HS как опорный и мягко добавь (до +30%); при необходимости отрази в planNote рекомендацию дубля (реальные actions ограничены списком ниже);',
+  '  • ограничь долю одного ad set внутри направления cap=40% от планового бюджета направления.',
+  '- При ПЕРЕБОРЕ — режь у худших HS на −20..−50% до выполнения планов.',
+  '- Перераспределение МЕЖДУ направлениями разрешено, только если квоты не жёсткие; при жёстких квотах перенос запрещён.',
+  '',
+  'ЖЁСТКИЕ ОГРАНИЧЕНИЯ ДЛЯ ДЕЙСТВИЙ',
+  '- Бюджеты в центах; допустимый дневной диапазон: 300..10000 (т.е. $3..$100).',
+  '- Повышение за шаг ≤ +30%; снижение за шаг до −50%.',
+  '- Перед любым Update*/Pause* по объектам внутри кампании ДОБАВЬ GetCampaignStatus этой кампании (первым действием для данного блока изменений).',
+  '- Никогда не добавляй неразрешённые типы действий. Если по логике нужен «дубль» — опиши в planNote/reportText как рекомендацию, но не включай несуществующий action.',
+  '',
+  'ДОСТУПНЫЕ ДЕЙСТВИЯ (РОВНО ЭТИ)',
   '- GetCampaignStatus {"campaign_id"}',
   '- PauseCampaign {"campaign_id","status":"PAUSED"}',
   '- UpdateAdSetDailyBudget {"adset_id","daily_budget"}',
+  '- PauseAd {"ad_id","status":"PAUSED"}',
+  '- Workflow.DuplicateAndPauseOriginal {"campaign_id","name?"} — дублирует кампанию и паузит оригинал (используется для реанимации)',
+  '- Workflow.DuplicateKeepOriginalActive {"campaign_id","name?"} — дублирует кампанию, оригинал оставляет активным (масштабирование)',
+  '- Audience.DuplicateAdSetWithAudience {"source_adset_id","audience_id","daily_budget?","name_suffix?"} — дубль ad set c заданной аудиторией (LAL3 IG Engagers 365d) без отключения Advantage+.',
   '',
-  'Формат ответа: СТРОГО JSON: { "planNote": string, "actions": [ ... ] }'
+  'ТРЕБОВАНИЯ К ВЫВОДУ (СТРОГО)',
+  '- Выведи ОДИН JSON-объект: { "planNote": string, "actions": Action[], "reportText": string } — и больше НИЧЕГО.',
+  '- Action: { "type": string, "params": object }. Тип — только из списка выше. Параметры обязательны и валидны.',
+  '- Для UpdateAdSetDailyBudget: daily_budget — целое число в центах ∈ [300..10000].',
+  '- Для PauseAd: обязателен ad_id; status="PAUSED".',
+  '- Для PauseCampaign: обязателен campaign_id; status="PAUSED".',
+  '- Для GetCampaignStatus: обязателен campaign_id.',
+  '- Перед любыми Update*/Pause* для конкретной кампании — один GetCampaignStatus именно этой кампании (повтор по другим кампаниям допускается).',
+  '',
+  'ПРАВИЛА ФОРМИРОВАНИЯ reportText',
+  '- Везде используй окно yesterday для агрегатов и кампаний; деньги в USD с 2 знаками после запятой.',
+  '- Лиды: messaging_total + lead_forms + site_leads; качественные: messaging_user_depth_2_message_send.',
+  '- CPL=spend/leads, QCPL=spend/quality_leads; при делении на 0 — выводи "н/д".',
+  '- Таймзона отчёта = таймзона аккаунта; дата отчёта — вчерашняя дата этой таймзоны.',
+  '- Раздел "Сводка по отдельным кампаниям" формируй ТОЛЬКО по АКТИВНЫМ кампаниям с результатом за yesterday (spend>0 или leads>0). Неактивные/безрезультатные — не включать.',
+  '- В "✅ Выполненные действия" перечисли КАЖДОЕ действие: объект (кампания/ad set/ad) по имени и ID, для UpdateAdSetDailyBudget укажи изменение бюджета X→Y в USD и причину (класс HS/ребаланс/лимиты). Если dispatch=false или validate_only — добавь пометку "(запланировано, validate_only)".',
+  '',
+  'СТРОГИЙ ШАБЛОН reportText (должен совпадать):',
+  '📅 Дата отчета: <YYYY-MM-DD>\n\n🏢 Статус рекламного кабинета: <Активен|Неактивен>\n\n📈 Общая сводка:\n- Общие затраты по всем кампаниям: <amount> USD\n- Общее количество полученных лидов: <int>\n- Общий CPL (стоимость за лид): <amount> USD\n- Общее количество качественных лидов: <int>\n- Общий CPL качественного лида: <amount> USD\n\n📊 Сводка по отдельным кампаниям:\n<n>. Кампания "<name>" (ID: <id>)\n   - Статус: <Активна|Неактивна>\n   - Затраты: <amount> USD\n   - Лидов: <int>\n   - CPL: <amount> USD\n   - Качественных лидов: <int>\n   - CPL качественного лида: <amount> USD\n\n📊 Качество лидов:\n- "<name>": <percent>% качественных лидов\n\n✅ Выполненные действия:\n1. Кампания "<name>":\n   - <краткая причина/действие>\n\n📊 Аналитика в динамике:\n- <наблюдение 1>\n- <наблюдение 2>\n\nДля дальнейшей оптимизации обращаем внимание на:\n- <рекомендация 1>\n- <рекомендация 2>',
+  '',
+  'ПРИМЕР ОТЧЁТА (вставляй в prompt как образец):',
+  '📅 Дата отчета: 2025-09-27',
+  '',
+  '🏢 Статус рекламного кабинета: Активен',
+  '',
+  '📈 Общая сводка:',
+  '- Общие затраты по всем кампаниям: 20.34 USD',
+  '- Общее количество полученных лидов: 13',
+  '- Общий CPL (стоимость за лид): 1.56 USD',
+  '- Общий количество качественных лидов: 10',
+  '- Общий CPL качественного лида: 2.03 USD',
+  '',
+  '📊 Сводка по отдельным кампаниям:',
+  '1. Кампания "Про вечерка 2" (ID: 120231837879690372)',
+  '   - Статус: Активна',
+  '   - Затраты: 6.10 USD',
+  '   - Лидов: 4',
+  '   - CPL: 1.525 USD',
+  '   - Качественных лидов: 3',
+  '   - CPL качественного лида: 2.03 USD',
+  '   ',
+  '2. Кампания "Березовая рошша" (ID: 120232793164110372)',
+  '   - Статус: Активна',
+  '   - Затраты: 7.14 USD',
+  '   - Лидов: 4',
+  '   - CPL: 1.785 USD',
+  '   - Качественных лидов: 2',
+  '   - CPL качественного лида: 3.57 USD',
+  '',
+  '3. Кампания "Ущелье бутаковка" (ID: 120232793466520372)',
+  '   - Статус: Активна',
+  '   - Затраты: 7.10 USD',
+  '   - Лидов: 5',
+  '   - CPL: 1.42 USD',
+  '   - Качественных лидов: 5',
+  '   - CPL качественного лида: 1.42 USD',
+  '',
+  '📊 Качество лидов:',
+  '- "Про вечерка 2": 75% качественных лидов',
+  '- "Березовая рошша": 50% качественных лидов',
+  '- "Ущелье бутаковка": 100% качественных лидов',
+  '',
+  '✅ Выполненные действия:',
+  '1. Кампания "Про вечерка 2":',
+  '   - Плановая стоимость качественного лида превышена.',
+  '   - Кампания показывает высокое качество лидов (75%), но CPL качественного лида выше целевого.',
+  '   - Бюджет близок к расходу, увеличений бюджета не требуется на данный момент.',
+  '   ',
+  '2. Кампания "Березовая рошша":',
+  '   - Превышена плановая стоимость качественного лида.',
+  '   - Показатель качества лидов ниже (50%), рекомендуется оценить и оптимизировать креативы.',
+  '   - Возможное снижение эффективности: необходимо проведение A/B тестирования креативов и текстов.',
+  '',
+  '3. Кампания "Ущелье бутаковка":',
+  '   - Кампания показывает отличный результат по качеству лидов (100%) и CPL ниже целевого.',
+  '   - Бюджет используется эффективно и близок к расходу.',
+  '   - При отсутствии ограничения бюджета следует рассмотреть возможность повторного увеличения для увеличения лидов.',
+  '',
+  '📊 Аналитика в динамике:',
+  '- Кампания "Про вечерка 2" продолжает поддерживать высокое качество при повышенных CPL, требуется работа с креативами.',
+  '- Кампания "Березовая рошша" показывает вариабельное качество и нуждается в оптимизации.',
+  '- "Ущелье бутаковка" стабильно продолжает показывать высокие результаты по качеству лидов.',
+  '',
+  'Для дальнейшей оптимизации обращаем внимание на:',
+  '- Проведение тестирования креативов и текстов для кампании "Березовая рошша".',
+  '- Возможное увеличение бюджета на "Ущелье бутаковка" при снижении стоимости лидов в других кампаниях.',
+  '',
+  'Действия по оптимизации не требуются на данный момент, контекстное улучшение креативов и стратегий может улучшить рентабельность.',
+  '',
+  'ПРИМЕРЫ JSON-ДЕЙСТВИЙ',
+  'ПРИМЕР 1 (масштабирование сильного ad set)',
+  'Example JSON:\n{\n  "planNote": "HS very_good → scale +30%",\n  "actions": [\n    { "type": "GetCampaignStatus", "params": { "campaign_id": "<CAMP_ID>" } },\n    { "type": "UpdateAdSetDailyBudget", "params": { "adset_id": "<ADSET_ID>", "daily_budget": 2600 } }\n  ],\n  "reportText": "<здесь итоговый отчёт по шаблону>"\n}',
+  '',
+  'ПРИМЕР 2 (снижение бюджета и пауза «пожирателя»)',
+  'Example JSON:\n{\n  "planNote": "HS bad → down -50%, pause top-spend ad; дублирование рекомендовано (см. reportText), но не включено в actions",\n  "actions": [\n    { "type": "GetCampaignStatus", "params": { "campaign_id": "<CAMP_ID>" } },\n    { "type": "UpdateAdSetDailyBudget", "params": { "adset_id": "<ADSET_ID>", "daily_budget": 1000 } },\n    { "type": "PauseAd", "params": { "ad_id": "<AD_ID>", "status": "PAUSED" } }\n  ],\n  "reportText": "<здесь итоговый отчёт по шаблону>"\n}',
+  '',
+  'Тул: SendActions',
+  `- POST ${AGENT_URL}`,
+  '- Headers: Content-Type: application/json',
+  '- BODY: { "idempotencyKey":"<uniq>", "source":"brain", "account":{"userAccountId":"<UUID>"}, "actions":[Action...] }',
+  '',
+  'САМОПРОВЕРКА ПЕРЕД ВЫВОДОМ (ОБЯЗАТЕЛЬНО):',
+  '- Вывод строго один JSON-объект без пояснений/текста вне JSON.',
+  '- reportText строго следует шаблону и НАЧИНАЕТСЯ с "📅 Дата отчета:".',
+  '- Если передан report.header_first_lines — начни reportText РОВНО с этого блока, без изменений.',
+  '- Если во входных данных передан раздел report (report_date, timezone, yesterday_totals, campaigns_yesterday, dispatch), используй эти значения напрямую.',
+  '- Если передан report_template — СКОПИРУЙ его как каркас и ЗАПОЛНИ значениями без изменения структуры.',
+  '- reportText содержит ВСЕ разделы в указанном порядке и точных заголовках:',
+  '  • "🏢 Статус рекламного кабинета:"',
+  '  • "📈 Общая сводка:" (ровно 5 строк показателей)',
+  '  • "📊 Сводка по отдельным кампаниям:" (нумерованный список с подпунктами)',
+  '  • "📊 Качество лидов:"',
+  '  • "✅ Выполненные действия:"',
+  '  • "📊 Аналитика в динамике:"',
+  '  • "Для дальнейшей оптимизации обращаем внимание на:"',
+  '- Не оставляй плейсхолдеры <...>; подставляй реальные значения или "н/д".',
+  '- Деньги: формат с двумя знаками после запятой, валюта USD.',
+  '- Везде используй окно yesterday для агрегатов и кампаний.',
+  '- Если нет действий — раздел остаётся, но с содержанием без фиктивных данных.',
+  '- Язык ответа — русский; никаких пояснений вне JSON.'
 ].join('\n');
 
 function validateAndNormalizeActions(actions) {
@@ -122,7 +574,27 @@ function validateAndNormalizeActions(actions) {
       const nb = toInt(params.daily_budget);
       if (nb === null) throw new Error('UpdateAdSetDailyBudget: daily_budget int cents required');
       if (nb > 10000) throw new Error('daily_budget > 10000 not allowed');
-      params.daily_budget = nb;
+      // enforce minimum $3 (300 cents)
+      params.daily_budget = Math.max(300, nb);
+    }
+    if (type === 'PauseAd') {
+      if (!params.ad_id) throw new Error('PauseAd: ad_id required');
+      params.status = 'PAUSED';
+    }
+    if (type === 'Audience.DuplicateAdSetWithAudience') {
+      if (!params.source_adset_id) throw new Error('Audience.DuplicateAdSetWithAudience: source_adset_id required');
+      if (!params.audience_id) throw new Error('Audience.DuplicateAdSetWithAudience: audience_id required');
+      if (params.daily_budget !== undefined) {
+        const nb = toInt(params.daily_budget);
+        if (nb === null) throw new Error('Audience.DuplicateAdSetWithAudience: daily_budget int cents required');
+        params.daily_budget = Math.max(300, Math.min(10000, nb));
+      }
+    }
+    if (type === 'Workflow.DuplicateAndPauseOriginal' || type === 'Workflow.DuplicateKeepOriginalActive') {
+      if (!params.campaign_id) throw new Error(`${type}: campaign_id required`);
+      if (params.name !== undefined && typeof params.name !== 'string') {
+        throw new Error(`${type}: name must be string if provided`);
+      }
     }
     cleaned.push({ type, params });
   }
@@ -136,7 +608,7 @@ async function sendActionsBatch(idem, userAccountId, actions) {
     headers: { 'content-type':'application/json' },
     body: JSON.stringify({
       idempotencyKey: idem,
-      source: 'n8n',
+      source: 'brain',
       account: { userAccountId },
       actions
     })
@@ -151,12 +623,57 @@ async function sendTelegram(chatId, text, token) {
   if (!chatId) return false;
   const bot = token || process.env.TELEGRAM_FALLBACK_BOT_TOKEN;
   if (!bot) return false;
+
+  const MAX_PART = 3800; // запас по лимиту 4096
+  const parts = [];
+  let remaining = String(text || '');
+  while (remaining.length > MAX_PART) {
+    parts.push(remaining.slice(0, MAX_PART));
+    remaining = remaining.slice(MAX_PART);
+  }
+  parts.push(remaining);
+
+  for (const part of parts) {
   const r = await fetch(`https://api.telegram.org/bot${bot}/sendMessage`, {
     method: 'POST',
     headers: { 'content-type':'application/json' },
-    body: JSON.stringify({ chat_id: String(chatId), text, parse_mode:'Markdown', disable_web_page_preview: true })
-  });
-  return r.ok;
+      // без parse_mode для надёжности (Markdown может ломаться)
+      body: JSON.stringify({ chat_id: String(chatId), text: part, disable_web_page_preview: true })
+    });
+    if (!r.ok) {
+      const errText = await r.text().catch(()=> '');
+      fastify.log.warn({ msg: 'telegram_send_failed', status: r.status, errText });
+      return false;
+    }
+  }
+  return true;
+}
+
+function finalizeReportText(raw, { adAccountId, dateStr }) {
+  let text = String(raw || '').trim();
+  const startIdx = text.indexOf('📅 Дата отчета:');
+  if (startIdx >= 0) {
+    text = text.slice(startIdx);
+  }
+  // Обрезаем, если LLM добавила последующие отчёты (например, "Отчёт 2:")
+  const cutMarkers = [/\nОтч[её]т\s*\d+\s*:/i, /\n=+\n/g];
+  for (const re of cutMarkers) {
+    const m = text.match(re);
+    if (m && m.index > 0) {
+      text = text.slice(0, m.index);
+    }
+  }
+  // Нормализуем строку статуса с корректным ID аккаунта
+  if (adAccountId) {
+    text = text.replace(
+      /(^|\n)🏢\s*Статус рекламного кабинета:[^\n]*/,
+      `\n🏢 Статус рекламного кабинета: Активен (ID: ${String(adAccountId)})`
+    );
+  }
+  // Простой лимит безопасности
+  const MAX_LEN = 3500;
+  if (text.length > MAX_LEN) text = text.slice(0, MAX_LEN - 3) + '...';
+  return text;
 }
 
 function buildReport({ date, accountStatus, insights, actions, lastReports }) {
@@ -168,10 +685,6 @@ function buildReport({ date, accountStatus, insights, actions, lastReports }) {
     ? actions.map((a,i)=>`${i+1}. ${a.type} — ${JSON.stringify(a.params)}`).join('\n')
     : 'Действия по оптимизации не требовались';
 
-  const last3 = (lastReports || [])
-    .map((r,i)=>`Отчёт ${i+1}:\n${typeof r.report_data==='string' ? r.report_data : JSON.stringify(r.report_data)}`)
-    .join('\n\n');
-
   const text = [
     `*Отчёт за ${date}*`,
     ``,
@@ -179,29 +692,49 @@ function buildReport({ date, accountStatus, insights, actions, lastReports }) {
     ``,
     `Выполненные действия:`,
     executed,
-    ``,
-    `Аналитика (последние 3 отчёта):`,
-    last3 || '—'
+    ``
   ].join('\n');
 
   return text;
 }
 
 async function llmPlan(systemPrompt, userPayload) {
-  const resp = await openai.chat.completions.create({
+  const resp = await openai.responses.create({
     model: MODEL,
-    temperature: 0,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: JSON.stringify(userPayload) }
-    ]
+    input: [
+      { role: 'system', content: [ { type: 'text', text: systemPrompt } ] },
+      { role: 'user', content: [ { type: 'text', text: JSON.stringify(userPayload) } ] }
+    ],
+    max_output_tokens: 20000
   });
-  const txt = resp.choices?.[0]?.message?.content || '{}';
-  let parsed;
-  try { parsed = JSON.parse(txt); }
-  catch { const m = txt.match(/\{[\s\S]*\}/); parsed = m ? JSON.parse(m[0]) : {}; }
-  if (!parsed || !Array.isArray(parsed.actions)) throw new Error('LLM invalid output');
-  return parsed;
+  const txt = resp.output_text || '';
+  let parsed = null;
+  let parseError = null;
+  if (txt) {
+    try {
+      parsed = JSON.parse(txt);
+    } catch (e) {
+      try {
+        const m = txt.match(/\{[\s\S]*\}/);
+        parsed = m ? JSON.parse(m[0]) : null;
+      } catch (e2) {
+        parseError = String(e2?.message || e2 || 'parse_failed');
+      }
+    }
+  } else {
+    parseError = 'empty_llm_response';
+  }
+  return {
+    parsed,
+    rawText: txt,
+    parseError,
+    meta: {
+      id: resp.id || null,
+      created: resp.created || null,
+      finish_reason: resp.output?.[0]?.finish_reason || null,
+      usage: resp?.usage || null
+    }
+  };
 }
 
 // POST /api/brain/run  { idempotencyKey?, userAccountId, inputs?:{ dispatch?:boolean } }
@@ -213,37 +746,302 @@ fastify.post('/api/brain/run', async (request, reply) => {
 
     const idem = idempotencyKey || genIdem();
 
+    if (BRAIN_DRY_RUN) {
+      const idem = idempotencyKey || genIdem();
+      const actionsDraft = [
+        { type: 'GetCampaignStatus', params: { campaign_id: '123' } },
+        { type: 'UpdateAdSetDailyBudget', params: { adset_id: '456', daily_budget: 3000 } },
+        { type: 'PauseAd', params: { adId: '789' } }
+      ];
+      const actions = validateAndNormalizeActions(actionsDraft);
+      let agentResponse = null;
+      if (inputs?.dispatch) {
+        agentResponse = await sendActionsBatch(idem, userAccountId, actions);
+      }
+      const date = new Date().toISOString().slice(0,10);
+      const reportText = buildReport({
+        date,
+        accountStatus: { account_status: 1 },
+        insights: [],
+        actions: inputs?.dispatch ? actions : [],
+        lastReports: []
+      });
+      const sent = false;
+      return reply.send({
+        idempotencyKey: idem,
+        planNote: 'dry_run_plan',
+        actions,
+        dispatched: !!inputs?.dispatch,
+        agentResponse,
+        telegramSent: sent
+      });
+    }
+
     const ua = await getUserAccount(userAccountId);
-    const [accountStatus, adsets, insights, lastReports] = await Promise.all([
+    const [accountStatus, adsets, insights] = await Promise.all([
       fetchAccountStatus(ua.ad_account_id, ua.access_token).catch(e=>({ error:String(e) })),
       fetchAdsets(ua.ad_account_id, ua.access_token).catch(e=>({ error:String(e) })),
-      fetchYesterdayInsights(ua.ad_account_id, ua.access_token).catch(e=>({ error:String(e) })),
-      getLastReports(ua.telegram_id)
+      fetchYesterdayInsights(ua.ad_account_id, ua.access_token).catch(e=>({ error:String(e) }))
     ]);
 
     const date = (insights?.data?.[0]?.date_start) || new Date().toISOString().slice(0,10);
-    const system = SYSTEM_PROMPT(ua.prompt3 || '');
-    const userPayload = {
+    // Детализация по окнам и HS/решениям (детерминированная логика v1.2)
+    const [yRows, d3Rows, d7Rows, d30Rows, todayRows, adRowsY, campY, camp3, camp7, camp30, campT, campList] = await Promise.all([
+      fetchInsightsPreset(ua.ad_account_id, ua.access_token, 'yesterday').then(r=>r.data||[]).catch(()=>[]),
+      fetchInsightsPreset(ua.ad_account_id, ua.access_token, 'last_3d').then(r=>r.data||[]).catch(()=>[]),
+      fetchInsightsPreset(ua.ad_account_id, ua.access_token, 'last_7d').then(r=>r.data||[]).catch(()=>[]),
+      fetchInsightsPreset(ua.ad_account_id, ua.access_token, 'last_30d').then(r=>r.data||[]).catch(()=>[]),
+      fetchInsightsPreset(ua.ad_account_id, ua.access_token, 'today').then(r=>r.data||[]).catch(()=>[]),
+      fetchAdLevelInsightsPreset(ua.ad_account_id, ua.access_token, 'yesterday').then(r=>r.data||[]).catch(()=>[]),
+      fetchCampaignInsightsPreset(ua.ad_account_id, ua.access_token, 'yesterday').then(r=>r.data||[]).catch(()=>[]),
+      fetchCampaignInsightsPreset(ua.ad_account_id, ua.access_token, 'last_3d').then(r=>r.data||[]).catch(()=>[]),
+      fetchCampaignInsightsPreset(ua.ad_account_id, ua.access_token, 'last_7d').then(r=>r.data||[]).catch(()=>[]),
+      fetchCampaignInsightsPreset(ua.ad_account_id, ua.access_token, 'last_30d').then(r=>r.data||[]).catch(()=>[]),
+      fetchCampaignInsightsPreset(ua.ad_account_id, ua.access_token, 'today').then(r=>r.data||[]).catch(()=>[]),
+      fetchCampaigns(ua.ad_account_id, ua.access_token).then(r=>r.data||[]).catch(()=>[])
+    ]);
+    const byY = indexByAdset(yRows);
+    const by3 = indexByAdset(d3Rows);
+    const by7 = indexByAdset(d7Rows);
+    const by30 = indexByAdset(d30Rows);
+    const byToday = indexByAdset(todayRows);
+    const adsByAdsetY = indexAdsByAdset(adRowsY);
+
+    const weights = { cpl_gap:45, trend:15, ctr_penalty:8, cpm_penalty:12, freq_penalty:10 };
+    const classes = { very_good:25, good:5, neutral_low:-5, bad:-25 };
+    const bounds = { minCents: 300, maxCents: 10000 };
+    const targets = { cpl_cents: 200 };
+
+    const byCY = indexByCampaign(campY);
+    const byC3 = indexByCampaign(camp3);
+    const byC7 = indexByCampaign(camp7);
+    const byC30 = indexByCampaign(camp30);
+    const byCT = indexByCampaign(campT);
+
+    const peers = { cpm: Array.from(byY.values()).map(v=>Number(v.cpm)||0) };
+
+    const decisions = [];
+    const hsSummary = [];
+    const traceAdsets = [];
+    const touchedCampaignIds = new Set();
+    const adsetList = Array.isArray(adsets?.data) ? adsets.data : [];
+    for (const as of adsetList) {
+      const id = as.id;
+      const windows = { y: byY.get(id)||{}, d3: by3.get(id)||{}, d7: by7.get(id)||{}, d30: by30.get(id)||{}, today: byToday.get(id)||{} };
+      const hs = computeHealthScoreForAdset({ weights, classes, targets, windows, peers });
+      hsSummary.push({ adset_id: id, name: as.name, hs: hs.score, cls: hs.cls, ctr: hs.ctr, cpm: hs.cpm, freq: hs.freq });
+      const cid = (windows.y && windows.y.campaign_id) || (windows.d3 && windows.d3.campaign_id) || (windows.d7 && windows.d7.campaign_id) || (windows.d30 && windows.d30.campaign_id) || null;
+      const actionsForAdset = [];
+      const reasons = [];
+      // обучение смягчается отчётом; шаги бюджетов строго по классам
+      const current = toInt(as.daily_budget);
+      if (current) {
+        const next = decideBudgetChange(current, hs.cls, bounds);
+        if (next !== current) {
+          decisions.push({ type:'UpdateAdSetDailyBudget', params:{ adset_id: id, daily_budget: next } });
+          actionsForAdset.push({ action: 'UpdateAdSetDailyBudget', from: current, to: next });
+          reasons.push(`hs_class=${hs.cls}`);
+          if (cid) touchedCampaignIds.add(String(cid));
+        } else {
+          reasons.push('no_change_budget');
+        }
+      } else {
+        reasons.push('no_daily_budget');
+      }
+      // Пожиратель объявлений (вчера): >=50% spend и плохой CPL
+      const ads = adsByAdsetY.get(id)||[];
+      const totalSpend = ads.reduce((s,a)=>s+(a.spend||0),0);
+      if (totalSpend > 0 && ads.length >= 2) {
+        // находим лидера по тратам
+        const sorted = ads.slice().sort((a,b)=>b.spend-a.spend);
+        const top = sorted[0];
+        if (top && top.spend >= 0.5*totalSpend) {
+          const L = computeLeadsFromActions(top);
+          const denom = (L.qualityLeads>=3 ? L.qualityLeads : (L.messagingLeads+L.siteLeads+ (L.formLeads||0)));
+          const e = denom>0 ? (top.spend*100)/denom : Infinity;
+          if (!Number.isFinite(e) || e > targets.cpl_cents*1.3) {
+            decisions.push({ type:'PauseAd', params:{ ad_id: top.ad_id, status: 'PAUSED' } });
+            actionsForAdset.push({ action: 'PauseAd', ad_id: top.ad_id, reason: 'ad_spend_share>=0.5 && poor_cpl' });
+            reasons.push('pause_poor_ad');
+            if (cid) touchedCampaignIds.add(String(cid));
+          }
+        }
+      }
+
+      traceAdsets.push({
+        adset_id: id,
+        name: as.name,
+        campaign_id: cid,
+        hs: hs.score,
+        cls: hs.cls,
+        metrics: { impressions: windows.y.impressions||0, spend: windows.y.spend||0, ctr: hs.ctr, cpm: hs.cpm, freq: hs.freq },
+        decisions: actionsForAdset,
+        reasons
+      });
+    }
+
+    // Prepend GetCampaignStatus for all touched campaigns
+    for (const cid of Array.from(touchedCampaignIds)) {
+      decisions.unshift({ type:'GetCampaignStatus', params:{ campaign_id: cid } });
+    }
+
+    // Подготовка данных для LLM и фолбэк на детерминистический план
+    const llmInput = {
       userAccountId,
-      account_status: accountStatus,
-      adsets: adsets?.data || [],
-      yesterday_insights: insights?.data || [],
-      last_reports: lastReports,
-      defaults: { target_cpl_cents: 200, default_daily_budget_cents: 2000 }
+      ad_account_id: ua?.ad_account_id || null,
+      account: {
+        timezone: ua?.account_timezone || 'Asia/Almaty',
+        report_date: date,
+        dispatch: !!inputs?.dispatch
+      },
+      limits: { min_cents: bounds.minCents, max_cents: bounds.maxCents, step_up: 0.30, step_down: 0.50 },
+      targets,
+      analysis: {
+        hsSummary,
+        touchedCampaignIds: Array.from(touchedCampaignIds),
+        totals: {
+          installed_daily_budget_cents_all: (adsetList||[]).reduce((s,a)=>s + (toInt(a.daily_budget)||0), 0),
+          installed_daily_budget_cents_active: (adsetList||[]).filter(a=>String(a.status||'')==='ACTIVE').reduce((s,a)=>s + (toInt(a.daily_budget)||0), 0)
+        },
+        campaigns: (campList||[]).filter(c=>String(c.status||c.effective_status||'').includes('ACTIVE')).map(c=>({
+          campaign_id: c.id,
+          name: c.name,
+          status: c.status,
+          daily_budget: toInt(c.daily_budget)||0,
+          lifetime_budget: toInt(c.lifetime_budget)||0,
+          windows: {
+            yesterday: byCY.get(c.id)||{},
+            last_3d: byC3.get(c.id)||{},
+            last_7d: byC7.get(c.id)||{},
+            last_30d: byC30.get(c.id)||{},
+            today: byCT.get(c.id)||{}
+          }
+        })),
+        adsets: (adsetList||[]).map(as=>{
+          const current = toInt(as.daily_budget)||0;
+          const maxUp = Math.max(0, Math.min(bounds.maxCents, Math.round(current*1.3)) - current);
+          const maxDown = Math.max(0, current - Math.max(bounds.minCents, Math.round(current*0.5)));
+          return {
+          adset_id: as.id,
+          name: as.name,
+          campaign_id: as.campaign_id,
+          daily_budget_cents: current,
+          status: as.status,
+          step_constraints: { step_up_max_pct: 0.30, step_down_max_pct: 0.50 },
+          step_bounds_cents: { max_increase: maxUp, max_decrease: maxDown },
+          windows: {
+            yesterday: byY.get(as.id)||{},
+            last_3d: by3.get(as.id)||{},
+            last_7d: by7.get(as.id)||{},
+            last_30d: by30.get(as.id)||{},
+            today: byToday.get(as.id)||{}
+          }
+          };
+        })
+      },
+      report: {
+        report_date: date,
+        timezone: ua?.account_timezone || 'Asia/Almaty',
+        dispatch: !!inputs?.dispatch,
+        // учитывать только активные кампании с результатом
+        yesterday_totals: (()=>{
+          const activeWithResults = (campList||[])
+            .filter(c => String(c.status||c.effective_status||'').includes('ACTIVE'))
+            .map(c=>({ c, y: byCY.get(c.id)||{} }))
+            .filter(({y})=> (Number(y.spend)||0) > 0 || (computeLeadsFromActions(y).leads||0) > 0);
+          const spend = activeWithResults.reduce((s,{y})=> s + (Number(y.spend)||0), 0);
+          const leads = activeWithResults.reduce((s,{y})=> s + (computeLeadsFromActions(y).leads||0), 0);
+          const ql = activeWithResults.reduce((s,{y})=> s + (computeLeadsFromActions(y).qualityLeads||0), 0);
+          return {
+            spend_usd: spend.toFixed(2),
+            leads_total: leads,
+            leads_quality: ql
+          };
+        })(),
+        header_first_lines: (()=>{
+          const d = date;
+          const activeWithResults = (campList||[])
+            .filter(c => String(c.status||c.effective_status||'').includes('ACTIVE'))
+            .map(c=>({ c, y: byCY.get(c.id)||{} }))
+            .filter(({y})=> (Number(y.spend)||0) > 0 || (computeLeadsFromActions(y).leads||0) > 0);
+          const spend = activeWithResults.reduce((s,{y})=> s + (Number(y.spend)||0), 0);
+          const Ltot = activeWithResults.reduce((s,{y})=> s + (computeLeadsFromActions(y).leads||0), 0);
+          const Lq = activeWithResults.reduce((s,{y})=> s + (computeLeadsFromActions(y).qualityLeads||0), 0);
+          const cpl = Ltot>0 ? (spend / Ltot) : null;
+          const qcpl = Lq>0 ? (spend / Lq) : null;
+          const status = (accountStatus?.account_status === 1) ? 'Активен' : 'Неактивен';
+          return [
+            `📅 Дата отчета: ${d}`,
+            '',
+            `🏢 Статус рекламного кабинета: ${status}`,
+            '',
+            '📈 Общая сводка:',
+            `- Общие затраты по всем кампаниям: ${spend.toFixed(2)} USD`,
+            `- Общее количество полученных лидов: ${Ltot}`,
+            `- Общий CPL (стоимость за лид): ${cpl!==null?cpl.toFixed(2):'н/д'} USD`,
+            `- Общее количество качественных лидов: ${Lq}`,
+            `- Общий CPL качественного лида: ${qcpl!==null?qcpl.toFixed(2):'н/д'} USD`
+          ].join('\n');
+        })(),
+        campaigns_yesterday: (campList||[])
+          .filter(c => String(c.status||c.effective_status||'').includes('ACTIVE'))
+          .map(c=>({ c, y: byCY.get(c.id)||{} }))
+          .filter(({y})=> (Number(y.spend)||0) > 0 || (computeLeadsFromActions(y).leads||0) > 0)
+          .map(({c,y})=>({
+            id: c.id,
+            name: c.name,
+            status: c.status,
+            spend_usd: Number(y.spend||0).toFixed(2),
+            leads: computeLeadsFromActions(y).leads || 0,
+            leads_quality: computeLeadsFromActions(y).qualityLeads || 0
+          })),
+        report_template: '📅 Дата отчета: <YYYY-MM-DD>\n\n🏢 Статус рекламного кабинета: <Активен|Неактивен>\n\n📈 Общая сводка:\n- Общие затраты по всем кампаниям: <amount> USD\n- Общее количество полученных лидов: <int>\n- Общий CPL (стоимость за лид): <amount> USD\n- Общее количество качественных лидов: <int>\n- Общий CPL качественного лида: <amount> USD\n\n📊 Сводка по отдельным кампаниям:\n<n>. Кампания "<name>" (ID: <id>)\n   - Статус: <Активна|Неактивна>\n   - Затраты: <amount> USD\n   - Лидов: <int>\n   - CPL: <amount> USD\n   - Качественных лидов: <int>\n   - CPL качественного лида: <amount> USD\n\n📊 Качество лидов:\n- "<name>": <percent>% качественных лидов\n\n✅ Выполненные действия:\n1. Кампания "<name>":\n   - <краткая причина/действие>\n\n📊 Аналитика в динамике:\n- <наблюдение 1>\n- <наблюдение 2>\n\nДля дальнейшей оптимизации обращаем внимание на:\n- <рекомендация 1>\n- <рекомендация 2>'
+      }
     };
 
-    const plan = USE_LLM ? await llmPlan(system, userPayload) : { planNote:'LLM disabled', actions: [] };
-    const actions = validateAndNormalizeActions(plan.actions);
+    let actions;
+    let planNote;
+    let planLLMRaw = null;
+    let reportTextFromLLM = null;
+    if (CAN_USE_LLM) {
+      try {
+        const system = SYSTEM_PROMPT(ua?.prompt3 || '');
+        const { parsed, rawText, parseError } = await llmPlan(system, llmInput);
+        planLLMRaw = { rawText, parseError, parsed };
+        if (!parsed || !Array.isArray(parsed.actions)) throw new Error(parseError || 'LLM invalid output');
+        actions = validateAndNormalizeActions(parsed.actions);
+        planNote = parsed.planNote || 'llm_plan_v1.2';
+        if (typeof parsed.reportText === 'string' && parsed.reportText.trim()) {
+          reportTextFromLLM = parsed.reportText.trim();
+        }
+      } catch (e) {
+        const limited = Array.isArray(decisions) ? decisions.slice(0, Math.max(0, BRAIN_MAX_ACTIONS_PER_RUN)) : [];
+        for (const cid of Array.from(touchedCampaignIds)) limited.unshift({ type:'GetCampaignStatus', params:{ campaign_id: cid } });
+        const planFb = { planNote:'deterministic_fallback_v1.2', actions: limited };
+        actions = validateAndNormalizeActions(planFb.actions);
+        planNote = planFb.planNote;
+      }
+    } else {
+      const limited = Array.isArray(decisions) ? decisions.slice(0, Math.max(0, BRAIN_MAX_ACTIONS_PER_RUN)) : [];
+      for (const cid of Array.from(touchedCampaignIds)) limited.unshift({ type:'GetCampaignStatus', params:{ campaign_id: cid } });
+      const planFb = { planNote:'deterministic_plan_v1.2', actions: limited };
+      actions = validateAndNormalizeActions(planFb.actions);
+      planNote = planFb.planNote;
+    }
 
     let agentResponse = null;
     if (inputs?.dispatch) {
       agentResponse = await sendActionsBatch(idem, userAccountId, actions);
     }
 
-    const reportText = buildReport({
+    const reportTextRaw = reportTextFromLLM && reportTextFromLLM.trim() ? reportTextFromLLM : buildReport({
       date, accountStatus, insights: insights?.data, actions: inputs?.dispatch ? actions : [],
-      lastReports
+      lastReports: []
     });
+    const reportText = finalizeReportText(reportTextRaw, { adAccountId: ua?.ad_account_id, dateStr: date });
+
+    // Собираем plan для сохранения
+    const plan = { planNote, actions, reportText: reportTextFromLLM || null };
 
     // Save report/logs
     let execStatus = 'success';
@@ -251,7 +1049,7 @@ fastify.post('/api/brain/run', async (request, reply) => {
       try {
         await supabase.from('campaign_reports').insert({
           telegram_id: String(ua.telegram_id || ''),
-          report_data: { text: reportText, date, planNote: plan.planNote, actions }
+          report_data: { text: reportText, date, planNote, actions }
         });
       } catch (e) {
         fastify.log.warn({ msg:'save_campaign_report_failed', error:String(e) });
@@ -272,16 +1070,21 @@ fastify.post('/api/brain/run', async (request, reply) => {
       }
     }
 
-    // Send Telegram
-    const sent = await sendTelegram(ua.telegram_id, reportText, ua.telegram_bot_token);
+    // Send Telegram (по умолчанию включено, отключается через sendReport: false)
+    const shouldSendTelegram = inputs?.sendReport !== false;
+    const sent = shouldSendTelegram ? await sendTelegram(ua.telegram_id, reportText, ua.telegram_bot_token) : false;
 
     return reply.send({
       idempotencyKey: idem,
-      planNote: plan.planNote,
+      planNote,
       actions,
       dispatched: !!inputs?.dispatch,
       agentResponse,
-      telegramSent: sent
+      telegramSent: sent,
+      trace: { adsets: traceAdsets },
+      reportText,
+      usedAdAccountId: ua?.ad_account_id || null,
+      ...(BRAIN_DEBUG_LLM ? { llm: { used: CAN_USE_LLM, model: MODEL, input: llmInput, plan: planLLMRaw } } : {})
     });
   } catch (err) {
     request.log.error(err);
